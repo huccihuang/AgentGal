@@ -162,7 +162,7 @@ async def _apply_command(
         return ChatResponse(narrator=text, targets=[], replies=[])
 
     if command == "/reset":
-        opening = await reset_game(show_opening=True)
+        opening = await reset_game()
         conversation = await get_conversation_by_id(db, conversation_id)
         if conversation is not None:
             conversation.dialogue_count = 0
@@ -288,6 +288,7 @@ async def run_chat(
         # narrator 也在可见列表中（上帝视角）
         visible_to = targets if "narrator" in targets else [*targets, "narrator"]
         round_id = f"{resolved_conversation_id}_{message_counter}"
+        previous_game_date = vector_store._conv_game_date.get(resolved_conversation_id)
         game_date = _extract_game_date(narrator_text)
         vector_store.add_round(
             visible_to,
@@ -295,6 +296,9 @@ async def run_chat(
             _format_round_content(user_input, narrator_text, replies),
             game_date=game_date,
         )
+        if previous_game_date and game_date and game_date != previous_game_date:
+            for agent in visible_to:
+                asyncio.create_task(vector_store.add_memory(agent, previous_game_date))
 
     _trigger_consolidation_if_needed(message_counter)
     return ChatResponse(narrator=narrator_text, targets=targets, replies=replies)

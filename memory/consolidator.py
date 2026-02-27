@@ -22,6 +22,7 @@ from memory.file_ops import (
     load_growth_for_prompt,
     load_text,
     normalize,
+    normalize,
     read_growth_entries,
     read_agent_file,
     safe_write_memory,
@@ -29,7 +30,9 @@ from memory.file_ops import (
     split_by_date,
     split_events_raw,
     write_growth_entries,
+    write_growth_entries,
 )
+from memory.vector_store import vector_store
 
 CONSOLIDATION_INTERVAL = int(os.getenv("CONSOLIDATION_INTERVAL", "10"))
 

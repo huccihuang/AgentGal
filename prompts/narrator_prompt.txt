@@ -65,7 +65,7 @@ TARGETS: [lilith, mitsuki]
 </example>
 
 <rules>
-- TARGETS：思考玩家这句话是说给谁听的，就把谁进 targets。**绝对不能漏掉TARGETS**。
+- TARGETS：场景中有谁，就把谁进 targets。**绝对不能漏掉TARGETS**。
   - 同场景角色默认互相可见，不在场的角色默认不可见
   - 消息/电话仅收件人可见
 - **绝对禁止替角色说话/行动**

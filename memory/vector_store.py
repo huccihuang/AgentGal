@@ -8,7 +8,6 @@ import hashlib
 import json
 import os
 import sqlite3
-import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -262,7 +261,8 @@ class VectorStore:
             game_date = extract_game_date(content)
         if game_date:
             self._conv_game_date[conv_id] = game_date
-        game_date = game_date or self._conv_game_date.get(conv_id, "")
+        if kind in ("round", "dialogue"):
+            game_date = game_date or self._conv_game_date.get(conv_id, "")
 
         embed_mode = "api"
         try:
@@ -343,6 +343,8 @@ class VectorStore:
                     (agent_name, date),
                 )
                 await db.execute(
+                    "DELETE FROM chunks WHERE source = 'memory' AND owner_agent = ? AND date = ?",
+                    (agent_name, date),
                     "DELETE FROM chunks WHERE source = 'memory' AND owner_agent = ? AND date = ?",
                     (agent_name, date),
                 )

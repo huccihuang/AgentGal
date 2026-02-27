@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 
 load_dotenv(PROJECT_ROOT / ".env")
 
-from memory.consolidator import MemoryConsolidator, _cleanup_old_backups
+from memory.consolidator import MemoryConsolidator, _cleanup_old_backups, build_fields_definition
 
 
 async def main(agent: str) -> None:
@@ -23,7 +23,8 @@ async def main(agent: str) -> None:
     print(f"原始: {len(content)} 字")
 
     prompt_tpl = Path("prompts/player_profile_consolidation_prompt.txt").read_text()
-    prompt = prompt_tpl.format(content=content)
+    fields_def = build_fields_definition(agent)
+    prompt = prompt_tpl.format(fields_definition=fields_def, content=content)
 
     consolidator = MemoryConsolidator()
     print("调用 LLM 中...")

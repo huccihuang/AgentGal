@@ -120,7 +120,7 @@ class AgentManager:
             limit_env = int(os.getenv("VECTOR_SEARCH_LIMIT", "5"))
         except ValueError:
             limit_env = 5
-        results = vector_store.search(agent_name, query, limit=limit_env)
+        results = vector_store.search(agent_name, query, limit=limit_env, kind="memory")
 
         if not results:
             return "（无相关记忆）"

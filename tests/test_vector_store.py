@@ -296,6 +296,9 @@ class TestVectorStoreEdgeCases:
             "玩家: 第二次\n旁白: **时间**：4月3日 08:10\nlilith: 重复",
         )
         await wait_for_search(store, "lilith", "重复", kind="round")
+        # 等待后台任务完成，避免写入未落盘时读取数据库
+        if store._background_tasks:
+            await asyncio.gather(*list(store._background_tasks), return_exceptions=True)
 
         # 查询数据库确认只写入了一条
         db = await store._get_db()

@@ -162,7 +162,7 @@ async def _apply_command(
         return ChatResponse(narrator=text, targets=[], replies=[])
 
     if command == "/reset":
-        opening = await reset_game(show_opening=True)
+        opening = await reset_game()
         conversation = await get_conversation_by_id(db, conversation_id)
         if conversation is not None:
             conversation.dialogue_count = 0

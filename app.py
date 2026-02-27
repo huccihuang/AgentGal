@@ -357,15 +357,8 @@ async def on_message(message: cl.Message):
     # 5. 顺序处理目标角色
     results = await _process_target_agents(targets, user_input)
 
-    # 6. 展示角色响应给玩家
-    for agent_name, response, _ in results:
-        if response:
-            await cl.Message(
-                content=response,
-                author=agent_name.capitalize(),
-            ).send()
-
     # 6.1 向量索引（每 N 轮一次）：一轮为“玩家→下一次玩家”之间
+    # 先写向量库，避免前端发送异常导致本轮丢失索引。
     visible_to = targets if "narrator" in targets else [*targets, "narrator"]
     round_id = f"chainlit_{_ensure_session_token()}_{message_counter}"
     previous_game_date = cl.user_session.get("game_date")
@@ -379,6 +372,20 @@ async def on_message(message: cl.Message):
     if previous_game_date and game_date and game_date != previous_game_date:
         for agent in visible_to:
             asyncio.create_task(vector_store.add_memory(agent, previous_game_date))
+
+    # 6. 展示角色响应给玩家（不影响索引写入）
+    for agent_name, response, _ in results:
+        if not response:
+            continue
+        try:
+            await cl.Message(
+                content=response,
+                author=agent_name.capitalize(),
+            ).send()
+        except Exception as e:
+            routing_logger.warning(
+                f"[Chainlit] send_failed op=send_reply agent={agent_name} round_id={round_id} error={e}"
+            )
 
     # 7. 每 N 轮触发记忆整理（后台执行，不阻塞用户交互）
     print(

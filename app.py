@@ -3,6 +3,7 @@
 import asyncio
 import os
 import re
+from uuid import uuid4
 
 import chainlit as cl
 from dotenv import load_dotenv
@@ -82,9 +83,47 @@ async def _handle_continue_game() -> None:
         await cl.Message(content=content, author=author).send()
 
 
+def _new_session_token() -> str:
+    return uuid4().hex[:8]
+
+
+def _ensure_session_token() -> str:
+    token = cl.user_session.get("session_token")
+    if not token:
+        token = _new_session_token()
+        cl.user_session.set("session_token", token)
+    return str(token)
+
+
+async def _try_startup_rebuild() -> None:
+    try:
+        await vector_store.init_tables()
+        db = await vector_store._get_db()
+        row = await (await db.execute("SELECT COUNT(*) FROM chunks")).fetchone()
+        chunks_count = int(row[0] if row else 0)
+    except Exception as e:
+        routing_logger.warning(f"[Memory][VectorStore] startup_recovery op=startup_recovery result=failed reason=health_check error={e}")
+        return
+
+    if chunks_count > 0:
+        return
+
+    routing_logger.info("[Memory][VectorStore] startup_recovery op=startup_recovery result=start reason=empty_db")
+    await cl.Message(content="检测到存档存在但向量库为空，正在自动重建索引...").send()
+    try:
+        await vector_store.rebuild("narrator")
+        routing_logger.info("[Memory][VectorStore] startup_recovery op=startup_recovery result=done")
+        await cl.Message(content="✅ 已自动完成向量索引重建。").send()
+    except Exception as e:
+        routing_logger.error(f"[Memory][VectorStore] startup_recovery op=startup_recovery result=failed reason=rebuild error={e}")
+        await cl.Message(content=f"⚠️ 自动重建失败，请手动执行 /rebuild。错误: {e}").send()
+
+
 @cl.on_chat_start
 async def on_chat_start():
     """聊天开始时的初始化 - 有记忆直接加载"""
+    cl.user_session.set("message_counter", 0)
+    _ensure_session_token()
     has_save = has_existing_save()
 
     if not has_save:
@@ -97,6 +136,7 @@ async def on_chat_start():
             await cl.Message(content=opening_text, author="Narrator").send()
     else:
         await _handle_continue_game()
+        await _try_startup_rebuild()
 
 
 # =============================================================================
@@ -245,6 +285,20 @@ async def _handle_reset_command() -> bool:
     if opening_text:
         await cl.Message(content=opening_text, author="Narrator").send()
     cl.user_session.set("message_counter", 0)
+    cl.user_session.set("game_date", None)
+    cl.user_session.set("session_token", _new_session_token())
+    return True
+
+
+async def _handle_rebuild_command() -> bool:
+    """处理 /rebuild 命令（重建向量索引）"""
+    await cl.Message(content="🔄 正在重建向量索引，请稍候...").send()
+    try:
+        await vector_store.rebuild("narrator")
+        await cl.Message(content="✅ 向量索引重建完成。").send()
+    except Exception as e:
+        routing_logger.error(f"[Memory][VectorStore] rebuild_failed op=rebuild error={e}")
+        await cl.Message(content=f"❌ 向量索引重建失败: {e}").send()
     return True
 
 
@@ -252,6 +306,7 @@ async def _handle_reset_command() -> bool:
 _COMMAND_HANDLERS: dict[str, callable] = {
     "/save": _handle_save_command,
     "/reset": _handle_reset_command,
+    "/rebuild": _handle_rebuild_command,
 }
 
 
@@ -312,13 +367,18 @@ async def on_message(message: cl.Message):
 
     # 6.1 向量索引（每 N 轮一次）：一轮为“玩家→下一次玩家”之间
     visible_to = targets if "narrator" in targets else [*targets, "narrator"]
-    round_id = f"chainlit_{message_counter}"
-    game_date = _extract_game_date(scene_description) or cl.user_session.get("game_date")
+    round_id = f"chainlit_{_ensure_session_token()}_{message_counter}"
+    previous_game_date = cl.user_session.get("game_date")
+    game_date = _extract_game_date(scene_description) or previous_game_date
     if game_date:
         cl.user_session.set("game_date", game_date)
     round_content = _format_round_content(user_input, scene_description if is_narrator_valid else None, results)
     # 每轮对话结束后后台索引（不阻塞）
     vector_store.add_round(visible_to, round_id, round_content, game_date=game_date)
+    # 游戏日期推进后，触发上一日期的 memory.md 入库（后台执行，不阻塞）
+    if previous_game_date and game_date and game_date != previous_game_date:
+        for agent in visible_to:
+            asyncio.create_task(vector_store.add_memory(agent, previous_game_date))
 
     # 7. 每 N 轮触发记忆整理（后台执行，不阻塞用户交互）
     print(

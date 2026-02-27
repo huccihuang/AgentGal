@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import array
 import asyncio
+import hashlib
 import json
 import os
 import sqlite3
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -17,21 +19,40 @@ import httpx
 from engine.config import PROJECT_ROOT, character_path, get_agent_names
 from log_config.routing import routing_logger
 from memory.file_ops import (
-    date_key,
     extract_game_date,
-    is_date_before,
-    load_consolidation_state,
     normalize,
     parse_cn_date,
     split_by_date,
     split_into_events,
 )
 
+import dotenv
+dotenv.load_dotenv()
+
 DB_PATH = str(PROJECT_ROOT / "data" / "vectors.sqlite")
 EMBED_MODEL = os.getenv("EMBEDDING_MODEL_ID") or os.getenv("EMBEDDING_MODEL") or "text-embedding-3-small"
 EMBED_API_KEY = os.getenv("EMBEDDING_API_KEY") or os.getenv("LLM_API_KEY", "")
 EMBED_API_URL = os.getenv("EMBEDDING_API_URL") or os.getenv("LLM_API_URL", "")
 EMBED_DIM = int(os.getenv("EMBEDDING_DIM", "1536"))
+
+
+def _embed_model() -> str:
+    return os.getenv("EMBEDDING_MODEL_ID") or os.getenv("EMBEDDING_MODEL") or "text-embedding-3-small"
+
+
+def _embed_key() -> str:
+    return os.getenv("EMBEDDING_API_KEY") or os.getenv("LLM_API_KEY", "")
+
+
+def _embed_url() -> str:
+    return os.getenv("EMBEDDING_API_URL") or os.getenv("LLM_API_URL", "")
+
+
+def _embed_dim() -> int:
+    try:
+        return int(os.getenv("EMBEDDING_DIM", "1536"))
+    except ValueError:
+        return 1536
 
 
 def _utcnow_iso() -> str:
@@ -43,19 +64,64 @@ def _to_vec_blob(vec: list[float]) -> bytes:
 
 
 def _validate_embed_config() -> None:
-    if not EMBED_API_KEY:
+    if not _embed_key():
         raise ValueError("EMBEDDING_API_KEY 或 LLM_API_KEY 未配置，无法计算向量")
-    if not EMBED_API_URL:
+    if not _embed_url():
         raise ValueError("EMBEDDING_API_URL 或 LLM_API_URL 未配置，无法计算向量")
+
+
+def _fallback_embedding(text: str, dim: int) -> list[float]:
+    seed = hashlib.sha256(text.encode("utf-8")).digest()
+    return [((seed[i % len(seed)] / 255.0) * 2.0 - 1.0) for i in range(dim)]
+
+
+def _parse_vec_dim(create_sql: str | None) -> int | None:
+    if not create_sql:
+        return None
+    m = re.search(r"F32\[(\d+)\]", create_sql)
+    return int(m.group(1)) if m else None
+
+
+async def _get_vec_dim_async(db: aiosqlite.Connection) -> int:
+    row = await (await db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='vec_chunks'")).fetchone()
+    return _parse_vec_dim(row[0] if row else None) or _embed_dim()
+
+
+def _get_vec_dim_sync(conn: sqlite3.Connection) -> int:
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='vec_chunks'").fetchone()
+    return _parse_vec_dim(row[0] if row else None) or _embed_dim()
+
+
+def _fit_vec_dim(vec: list[float], target_dim: int) -> list[float]:
+    n = len(vec)
+    if n == target_dim:
+        return vec
+    if n > target_dim:
+        return vec[:target_dim]
+    return vec + [0.0] * (target_dim - n)
+
+
+def _cn_date_sql_expr(column: str = "date") -> str:
+    return (
+        f"(CAST(substr({column}, 1, instr({column}, '月') - 1) AS INTEGER) * 100 "
+        f"+ CAST(substr({column}, instr({column}, '月') + 1, instr({column}, '日') - instr({column}, '月') - 1) AS INTEGER))"
+    )
+
+
+def _valid_cn_date_sql(column: str = "date") -> str:
+    return f"instr({column}, '月') > 1 AND instr({column}, '日') > instr({column}, '月')"
 
 
 async def _embed_async(texts: list[str]) -> list[list[float]]:
     _validate_embed_config()
+    model = _embed_model()
+    api_key = _embed_key()
+    api_url = _embed_url()
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(
-            EMBED_API_URL,
-            headers={"Authorization": f"Bearer {EMBED_API_KEY}", "Content-Type": "application/json"},
-            json={"model": EMBED_MODEL, "input": texts},
+            api_url,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"model": model, "input": texts},
         )
         resp.raise_for_status()
         return [d["embedding"] for d in resp.json()["data"]]
@@ -63,10 +129,13 @@ async def _embed_async(texts: list[str]) -> list[list[float]]:
 
 def _embed_sync(texts: list[str]) -> list[list[float]]:
     _validate_embed_config()
+    model = _embed_model()
+    api_key = _embed_key()
+    api_url = _embed_url()
     resp = httpx.post(
-        EMBED_API_URL,
-        headers={"Authorization": f"Bearer {EMBED_API_KEY}", "Content-Type": "application/json"},
-        json={"model": EMBED_MODEL, "input": texts},
+        api_url,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={"model": model, "input": texts},
         timeout=60,
     )
     resp.raise_for_status()
@@ -77,9 +146,7 @@ class VectorStore:
     def __init__(self):
         self._db: aiosqlite.Connection | None = None
         self._conv_game_date: dict[str, str] = {}
-        self._memory_index_cutoff: dict[str, str] = {}
         self._background_tasks: set[asyncio.Task] = set()
-        self._memory_index_tasks: set[asyncio.Task] = set()
         self._write_lock: asyncio.Lock | None = None
         self._write_lock_loop: asyncio.AbstractEventLoop | None = None
         self.character_path = character_path
@@ -162,7 +229,7 @@ class VectorStore:
         await db.execute(
             f"""
             CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(
-                embedding F32[{EMBED_DIM}]
+                embedding F32[{_embed_dim()}]
             )
             """
         )
@@ -175,19 +242,6 @@ class VectorStore:
             await db.execute("UPDATE vec_chunks SET embedding = ? WHERE rowid = ?", (blob, rowid))
         else:
             await db.execute("INSERT INTO vec_chunks(rowid, embedding) VALUES (?, ?)", (rowid, blob))
-
-    def add(
-        self,
-        visible_to: list[str],
-        round_id: str,
-        content: str,
-        kind: str = "round",
-        game_date: str | None = None,
-    ):
-        if kind in ("round", "dialogue"):
-            self.add_round(visible_to, round_id, content, game_date=game_date)
-            return
-        raise ValueError(f"不支持的 kind: {kind}")
 
     def add_round(self, visible_to: list[str], round_id: str, content: str, game_date: str | None = None):
         task = asyncio.create_task(self._do_add_round(visible_to, round_id, content, game_date))
@@ -202,7 +256,6 @@ class VectorStore:
         game_date: str | None = None,
     ):
         conv_id = round_id.rsplit("_", 1)[0]
-        prev_game_date = self._conv_game_date.get(conv_id)
         visible = list(dict.fromkeys(visible_to))
 
         if game_date is None:
@@ -211,17 +264,20 @@ class VectorStore:
             self._conv_game_date[conv_id] = game_date
         game_date = game_date or self._conv_game_date.get(conv_id, "")
 
+        embed_mode = "api"
         try:
             embedding = (await _embed_async([content]))[0]
         except Exception as e:
-            self._log("error", "embed_failed", op="add_round", round_id=round_id, error=e)
-            return
+            embedding = _fallback_embedding(content, _embed_dim())
+            embed_mode = "fallback"
+            self._log("warning", "embed_failed", op="add_round", round_id=round_id, error=e)
 
         db: aiosqlite.Connection | None = None
         try:
             async with self._get_write_lock():
                 await self.init_tables()
                 db = await self._get_db()
+                vec_dim = await _get_vec_dim_async(db)
                 await db.execute("BEGIN")
 
                 now_iso = _utcnow_iso()
@@ -244,110 +300,13 @@ class VectorStore:
                     rowid = int(cur.lastrowid or 0)
 
                 if rowid:
-                    await self._upsert_vec_chunk(db, rowid, embedding)
+                    await self._upsert_vec_chunk(db, rowid, _fit_vec_dim(embedding, vec_dim))
                 await db.commit()
 
-            self._log("info", "add_round", op="add_round", round_id=round_id, result="ok")
-            if prev_game_date and game_date and game_date != prev_game_date:
-                self._trigger_memory_indexing(visible, game_date)
+            self._log("info", "add_round", op="add_round", round_id=round_id, embed=embed_mode, result="ok")
         except Exception as e:
             await self._rollback(db, op="add_round", round_id=round_id)
             self._log("error", "add_round", op="add_round", round_id=round_id, result="failed", error=e)
-
-    def _trigger_memory_indexing(self, visible_to: list[str], game_date: str):
-        for agent in list(dict.fromkeys(visible_to)):
-            self._log("info", "trigger_index", op="index_memory_before_date", agent=agent, game_date=game_date)
-            task = asyncio.create_task(self._index_memory_before_date(agent, game_date))
-            self._memory_index_tasks.add(task)
-            task.add_done_callback(self._memory_index_tasks.discard)
-
-    async def _index_memory_before_date(self, agent_name: str, fallback_cutoff: str):
-        cutoff = load_consolidation_state(agent_name) or fallback_cutoff
-        if not parse_cn_date(cutoff):
-            self._log(
-                "info",
-                "index_skip",
-                op="index_memory_before_date",
-                agent=agent_name,
-                reason="invalid_cutoff",
-                cutoff=cutoff,
-            )
-            return
-        if self._memory_index_cutoff.get(agent_name) == cutoff:
-            self._log(
-                "info",
-                "index_skip",
-                op="index_memory_before_date",
-                agent=agent_name,
-                reason="same_cutoff",
-                cutoff=cutoff,
-            )
-            return
-
-        path = Path(self.character_path(agent_name, "memory.md"))
-        if not path.exists():
-            alt = Path(self.character_path(agent_name, "Memory.md"))
-            if not alt.exists():
-                self._log(
-                    "info",
-                    "index_skip",
-                    op="index_memory_before_date",
-                    agent=agent_name,
-                    reason="memory_not_found",
-                )
-                return
-            path = alt
-
-        payloads: list[tuple[str, str, str]] = []
-        for date, body in split_by_date(normalize(path.read_text(encoding="utf-8"))).items():
-            if not is_date_before(date, cutoff):
-                continue
-            for idx, event in enumerate(split_into_events(body), start=1):
-                text = event.strip()
-                if text:
-                    payloads.append((f"memory::{agent_name}::{date}::{idx}", date, text))
-
-        db: aiosqlite.Connection | None = None
-        try:
-            async with self._get_write_lock():
-                await self.init_tables()
-                db = await self._get_db()
-                await db.execute("BEGIN")
-                await db.execute(
-                    "DELETE FROM vec_chunks WHERE rowid IN (SELECT id FROM chunks WHERE source = 'memory' AND owner_agent = ?)",
-                    (agent_name,),
-                )
-                await db.execute("DELETE FROM chunks WHERE source = 'memory' AND owner_agent = ?", (agent_name,))
-
-                if payloads:
-                    embeddings = await _embed_async([item[2] for item in payloads])
-                    visible_json = json.dumps([agent_name], ensure_ascii=False)
-                    now_iso = _utcnow_iso()
-                    for i, (chunk_id, date, text) in enumerate(payloads):
-                        row = await (await db.execute("SELECT id FROM chunks WHERE round_id = ?", (chunk_id,))).fetchone()
-                        if row:
-                            rowid = int(row[0])
-                            await db.execute(
-                                "UPDATE chunks SET date = ?, created_at = ?, visible_to = ?, content = ?, "
-                                "source = 'memory', owner_agent = ? WHERE id = ?",
-                                (date, now_iso, visible_json, text, agent_name, rowid),
-                            )
-                        else:
-                            cur = await db.execute(
-                                "INSERT INTO chunks(round_id, date, created_at, visible_to, content, source, owner_agent) "
-                                "VALUES (?, ?, ?, ?, ?, 'memory', ?)",
-                                (chunk_id, date, now_iso, visible_json, text, agent_name),
-                            )
-                            rowid = int(cur.lastrowid or 0)
-                        if rowid:
-                            await self._upsert_vec_chunk(db, rowid, embeddings[i])
-
-                await db.commit()
-                self._memory_index_cutoff[agent_name] = cutoff
-                self._log("info", "index_done", op="index_memory_before_date", agent=agent_name, cutoff=cutoff, events=len(payloads))
-        except Exception as e:
-            await self._rollback(db, op="index_memory_before_date", agent=agent_name, cutoff=cutoff)
-            self._log("error", "index_failed", op="index_memory_before_date", agent=agent_name, cutoff=cutoff, error=e)
 
     async def add_memory(self, agent_name: str, date: str):
         if not parse_cn_date(date):
@@ -377,6 +336,7 @@ class VectorStore:
             async with self._get_write_lock():
                 await self.init_tables()
                 db = await self._get_db()
+                vec_dim = await _get_vec_dim_async(db)
                 await db.execute("BEGIN")
                 await db.execute(
                     "DELETE FROM vec_chunks WHERE rowid IN (SELECT id FROM chunks WHERE source = 'memory' AND owner_agent = ? AND date = ?)",
@@ -387,7 +347,13 @@ class VectorStore:
                     (agent_name, date),
                 )
 
-                embeddings = await _embed_async([item[1] for item in payloads])
+                embed_mode = "api"
+                try:
+                    embeddings = await _embed_async([item[1] for item in payloads])
+                except Exception as e:
+                    embeddings = [_fallback_embedding(item[1], _embed_dim()) for item in payloads]
+                    embed_mode = "fallback"
+                    self._log("warning", "embed_failed", op="add_memory", agent=agent_name, date=date, error=e)
                 visible_json = json.dumps([agent_name], ensure_ascii=False)
                 now_iso = _utcnow_iso()
                 for i, (chunk_id, text) in enumerate(payloads):
@@ -398,10 +364,19 @@ class VectorStore:
                     )
                     rowid = int(cur.lastrowid or 0)
                     if rowid:
-                        await self._upsert_vec_chunk(db, rowid, embeddings[i])
+                        await self._upsert_vec_chunk(db, rowid, _fit_vec_dim(embeddings[i], vec_dim))
                 await db.commit()
 
-            self._log("info", "add_memory", op="add_memory", agent=agent_name, date=date, events=len(payloads), result="ok")
+            self._log(
+                "info",
+                "add_memory",
+                op="add_memory",
+                agent=agent_name,
+                date=date,
+                events=len(payloads),
+                embed=embed_mode,
+                result="ok",
+            )
         except Exception as e:
             await self._rollback(db, op="add_memory", agent=agent_name, date=date)
             self._log("error", "add_memory_failed", op="add_memory", agent=agent_name, date=date, error=e)
@@ -409,6 +384,7 @@ class VectorStore:
     async def rebuild(self, agent_name: str):
         import glob
 
+        t0 = asyncio.get_event_loop().time()
         _ = agent_name
         await self.init_tables()
         db = await self._get_db()
@@ -471,7 +447,15 @@ class VectorStore:
             content, vis, game_date = format_round(msgs)
             await self._do_add_round(vis, f"rebuild_{counter}", content, game_date)
 
-        self._log("info", "rebuild", op="rebuild", rounds=counter, result="ok")
+        self._log(
+            "info",
+            "rebuild",
+            op="rebuild",
+            files=len(files),
+            rounds=counter,
+            elapsed=f"{asyncio.get_event_loop().time() - t0:.1f}s",
+            result="ok",
+        )
 
     def search(
         self,
@@ -491,13 +475,17 @@ class VectorStore:
         try:
             qvec = _embed_sync([query])[0]
         except Exception as e:
-            self._log("error", "search_embed_failed", op="search", agent=agent_name, error=e)
-            return []
+            qvec = _fallback_embedding(query, _embed_dim())
+            self._log("warning", "search_embed_failed", op="search", agent=agent_name, error=e, fallback="on")
 
         conn: sqlite3.Connection | None = None
         try:
             conn = sqlite3.connect(DB_PATH)
             self._load_sqlite_vec_sync(conn)
+            vec_dim = _get_vec_dim_sync(conn)
+            qvec = _fit_vec_dim(qvec, vec_dim)
+            date_expr = _cn_date_sql_expr("date")
+            valid_date = _valid_cn_date_sql("date")
 
             if kind == "round":
                 scope_sql = (
@@ -509,27 +497,43 @@ class VectorStore:
                 scope_sql = "SELECT id FROM chunks WHERE source = 'memory' AND owner_agent = ?"
                 scope_params = (agent_name,)
             else:
-                cutoff = load_consolidation_state(agent_name)
-                cutoff_valid = bool(parse_cn_date(cutoff or ""))
-                cutoff_value = date_key(cutoff or "") or -1
-                scope_sql = """
-                SELECT id FROM chunks
-                WHERE (
-                  source = 'round'
-                  AND EXISTS (SELECT 1 FROM json_each(chunks.visible_to) WHERE json_each.value = ?)
-                ) OR (
-                  source = 'memory'
-                  AND owner_agent = ?
-                  AND ? = 1
-                  AND instr(date, '月') > 1
-                  AND instr(date, '日') > instr(date, '月')
-                  AND (
-                    CAST(substr(date, 1, instr(date, '月') - 1) AS INTEGER) * 100
-                    + CAST(substr(date, instr(date, '月') + 1, instr(date, '日') - instr(date, '月') - 1) AS INTEGER)
-                  ) < ?
-                )
-                """
-                scope_params = (agent_name, agent_name, 1 if cutoff_valid else 0, cutoff_value)
+                today_row = conn.execute(
+                    f"""
+                    SELECT MAX(CASE WHEN {valid_date} THEN {date_expr} END)
+                    FROM chunks
+                    WHERE source = 'round'
+                    AND EXISTS (SELECT 1 FROM json_each(chunks.visible_to) WHERE json_each.value = ?)
+                    """,
+                    (agent_name,),
+                ).fetchone()
+                today_key = int(today_row[0]) if today_row and today_row[0] is not None else None
+
+                if today_key is None:
+                    fallback_round_limit = max(limit * 5, 20)
+                    scope_sql = """
+                    SELECT id FROM chunks
+                    WHERE source = 'round'
+                    AND EXISTS (SELECT 1 FROM json_each(chunks.visible_to) WHERE json_each.value = ?)
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """
+                    scope_params = (agent_name, fallback_round_limit)
+                else:
+                    scope_sql = f"""
+                    SELECT id FROM chunks
+                    WHERE (
+                      source = 'round'
+                      AND EXISTS (SELECT 1 FROM json_each(chunks.visible_to) WHERE json_each.value = ?)
+                      AND {valid_date}
+                      AND {date_expr} = ?
+                    ) OR (
+                      source = 'memory'
+                      AND owner_agent = ?
+                      AND {valid_date}
+                      AND {date_expr} < ?
+                    )
+                    """
+                    scope_params = (agent_name, today_key, agent_name, today_key)
 
             candidate_limit = max(limit * 10, 50)
             rows = conn.execute(
@@ -567,10 +571,8 @@ class VectorStore:
             if conn is not None:
                 conn.close()
 
-    async def delete(self, agent_name: str) -> bool:
+    async def _delete_agent_scope(self, db: aiosqlite.Connection, agent_name: str) -> bool:
         try:
-            await self.init_tables()
-            db = await self._get_db()
             await db.execute(
                 "DELETE FROM vec_chunks WHERE rowid IN "
                 "(SELECT id FROM chunks WHERE EXISTS "
@@ -582,11 +584,9 @@ class VectorStore:
                 "(SELECT 1 FROM json_each(visible_to) WHERE json_each.value = ?)",
                 (agent_name,),
             )
-            await db.commit()
-            self._log("info", "delete", op="delete", agent=agent_name, result="ok")
             return True
         except Exception as e:
-            self._log("error", "delete_failed", op="delete", agent=agent_name, error=e)
+            self._log("error", "delete_failed", op="delete_all_agents", agent=agent_name, error=e)
             return False
 
     async def delete_all_agents(self, agent_names: list[str]) -> dict[str, bool]:
@@ -606,15 +606,27 @@ class VectorStore:
                     await db.execute("DELETE FROM chunks")
                     await db.commit()
                 self._conv_game_date.clear()
-                self._memory_index_cutoff.clear()
                 self._log("info", "delete_all", op="delete_all_agents", mode="full", result="ok")
                 return {name: True for name in unique_names}
             except Exception as e:
                 await self._rollback(db, op="delete_all_agents", mode="full")
                 self._log("warning", "delete_all_fallback", op="delete_all_agents", error=e)
-
-        results = await asyncio.gather(*(self.delete(name) for name in unique_names))
-        return dict(zip(unique_names, results))
+        db: aiosqlite.Connection | None = None
+        try:
+            await self.init_tables()
+            db = await self._get_db()
+            async with self._get_write_lock():
+                await db.execute("BEGIN")
+                results = {}
+                for name in unique_names:
+                    results[name] = await self._delete_agent_scope(db, name)
+                await db.commit()
+            self._log("info", "delete_all", op="delete_all_agents", mode="partial", count=len(unique_names), result="ok")
+            return results
+        except Exception as e:
+            await self._rollback(db, op="delete_all_agents", mode="partial")
+            self._log("error", "delete_all_failed", op="delete_all_agents", mode="partial", error=e)
+            return {name: False for name in unique_names}
 
 
 vector_store = VectorStore()

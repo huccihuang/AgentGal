@@ -32,79 +32,109 @@ from memory.file_ops import (
 from memory.vector_store import vector_store
 
 
-# ---------------------------------------------------------------------------
-# Agent 构建
-# ---------------------------------------------------------------------------
+class AgentManager:
+    """管理所有角色的 Agent 实例"""
 
-def _get_display_name(agent_name: str, soul_content: str) -> str:
-    """从 soul.md 内容提取中文显示名，回退到 agent_name。"""
-    role_match = re.search(r"<role>\s*([^\n<]+)", soul_content)
-    if role_match:
-        name_match = re.match(r"([\u4e00-\u9fff·]+)", role_match.group(1).strip())
-        if name_match:
-            return name_match.group(1)
-    title_match = re.search(r"^#\s+(.+)$", soul_content, re.MULTILINE)
-    if title_match:
-        return title_match.group(1).strip()
-    return agent_name
+    def __init__(self):
+        self.agents: dict[str, Agent] = {}
+        self._current_input: str = ""  # 用于传递当前用户输入给 instructions 回调
+        self._init_agents()
 
+    def _init_agents(self):
+        """初始化所有角色 Agent"""
+        for agent_name in get_agent_names():
+            self.agents[agent_name] = self._create_agent(agent_name)
 
-def _load_prompt_template(agent_name: str) -> str:
-    """加载 system prompt 模板文件。"""
-    filename = "narrator_prompt.txt" if agent_name == "narrator" else "character_prompt.txt"
-    return (PROJECT_ROOT / "prompts" / filename).read_text(encoding="utf-8")
+    @staticmethod
+    def _extract_user_message_from_input(full_input: str) -> str:
+        """从拼接的完整输入中提取原始用户消息。
 
+        输入格式:
+            最近对话历史:\n\n{history}\n\n---\n\n玩家新消息: {user_input}
+        """
+        match = re.search(r"玩家新消息:\s*(.+)$", full_input, re.MULTILINE | re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        return full_input.strip()
 
-def _build_system_prompt(agent_name: str, soul_content: str) -> str:
-    """构建 system prompt（每次调用时重新读取记忆文件）。"""
-    status_content = read_agent_file(agent_name, "status.md")
-    user_content = read_agent_file(agent_name, "user.md") if agent_name != "narrator" else ""
-    growth_content = load_growth_for_prompt(agent_name)
-    prompt_template = _load_prompt_template(agent_name)
-    status_fields = "、".join(get_allowed_fields(agent_name, "status"))
-    player_fields = "、".join(get_allowed_fields(agent_name, "user")) if agent_name != "narrator" else ""
-    display_name = _get_display_name(agent_name, soul_content)
+    def _create_agent(self, agent_name: str) -> Agent:
+        """创建单个 Agent（预创建，复用）"""
+        # 加载静态角色设定（soul.md 是只读的）
+        soul_content = read_agent_file(agent_name, "soul.md")
 
-    characters = get_agent_names(include_narrator=False)
-    characters_scene_list = "\n".join(
-        f"- {_get_display_name(c, read_agent_file(c, 'soul.md'))}：[位置] 或 不在场"
-        for c in characters
-    )
-    valid_targets = ", ".join(characters)
+        # 定义动态 instructions 函数，每次运行时重新加载记忆文件
+        def get_dynamic_instructions(agent: Agent, run_context=None) -> str:
+            # 从实例变量获取当前输入，提取原始用户消息用于 RAG
+            user_input = self._current_input
+            routing_logger.debug(f"[AgentManager] instructions 回调: agent={agent_name}, input_len={len(user_input)}")
 
-    return prompt_template.format(
-        agent_name=agent_name,
-        display_name=display_name,
-        soul=soul_content,
-        growth=growth_content,
-        status=status_content if status_content else "（尚无状态记录）",
-        user_profile=user_content if user_content else "（尚无玩家认知）",
-        status_fields=status_fields,
-        player_fields=player_fields,
-        characters_scene_list=characters_scene_list,
-        valid_targets=valid_targets,
-    )
+            # 同步 RAG 搜索相关记忆
+            relevant_memories = self._search_relevant_memories_sync(
+                agent_name, user_input
+            )
 
+            # 加载 memory.md 最后5行作为 recent_memories
+            recent_memories = read_file_tail(
+                character_path(agent_name, "memory.md"), lines=5
+            )
+            if not recent_memories:
+                recent_memories = "（尚无记忆）"
 
-# ---------------------------------------------------------------------------
-# 记忆注入
-# ---------------------------------------------------------------------------
+            # 加载 status.md
+            status_content = read_agent_file(agent_name, "status.md")
 
-def _extract_user_message(full_input: str) -> str:
-    """从拼接输入中提取原始玩家消息，用于 RAG 搜索。"""
-    match = re.search(r"玩家新消息:\s*(.+)$", full_input, re.MULTILINE | re.DOTALL)
-    return match.group(1).strip() if match else full_input.strip()
+            # 加载 user.md
+            user_content = read_agent_file(agent_name, "user.md")
 
+            # 加载 growth.md
+            growth_content = load_growth_for_prompt(agent_name)
 
-def _search_memories(agent_name: str, query: str) -> str:
-    """语义搜索向量库，返回格式化记忆字符串。"""
-    try:
-        limit = int(os.getenv("VECTOR_SEARCH_LIMIT", "5"))
-    except ValueError:
-        limit = 5
-    results = vector_store.search(agent_name, query, limit=limit, kind="memory")
-    memories = [r["content"].strip() for r in results if r["content"].strip()]
-    return "\n\n---\n\n".join(memories) if memories else "（无相关记忆）"
+            # 加载并填充 system prompt 模板
+            prompt_template = self._load_system_prompt_template(agent_name)
+            # 动态获取字段白名单（从文件读取，失败回退到默认值）
+            status_fields = "、".join(get_allowed_fields(agent_name, "status"))
+            player_fields = "、".join(get_allowed_fields(agent_name, "user"))
+            return prompt_template.format(
+                agent_name=agent_name,
+                soul=soul_content,
+                growth=growth_content,
+                memory=relevant_memories,
+                recent_memories=recent_memories,
+                status=status_content if status_content else "（尚无状态记录）",
+                user_profile=user_content if user_content else "（尚无玩家认知）",
+                status_fields=status_fields,
+                player_fields=player_fields,
+            )
+
+        return Agent(
+            name=agent_name,
+            model=get_model(),
+            instructions=get_dynamic_instructions,
+            markdown=True,
+            post_hooks=[log_agent_run],
+            # 禁用 Agno 内部历史管理，由应用层通过 jsonl 自行管理
+            add_history_to_context=False,
+        )
+
+    def _search_relevant_memories_sync(self, agent_name: str, query: str) -> str:
+        """同步搜索相关记忆，用于 instructions 函数"""
+        try:
+            limit_env = int(os.getenv("VECTOR_SEARCH_LIMIT", "5"))
+        except ValueError:
+            limit_env = 5
+        results = vector_store.search(agent_name, query, limit=limit_env, kind="memory")
+
+        if not results:
+            return "（无相关记忆）"
+
+        # 格式化召回的记忆
+        memories = []
+        for r in results:
+            content = r["content"].strip()
+            if content:
+                memories.append(content)
+
+        return "\n\n---\n\n".join(memories) if memories else "（无相关记忆）"
 
 
 def _build_memory_prefix(agent_name: str, user_input: str) -> str:

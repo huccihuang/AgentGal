@@ -31,6 +31,10 @@ def _normalize_optional(value: str | None) -> str | None:
     return value or None
 
 
+# 公共暴露：供 server / pricing 等同步读取，避免 os.getenv 散落
+LLM_MODEL_ID: str = _get_optional_env("LLM_MODEL_ID") or ""
+
+
 def _normalize_api_url(api_url: str) -> str:
     """归一化 OpenAI 兼容 Base URL，避免重复拼接 chat/completions。"""
     normalized = api_url.rstrip("/")

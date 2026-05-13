@@ -94,8 +94,12 @@ document.addEventListener("alpine:init", () => {
         this.characterCount = initState.character_count || 0;
         this.initialRecent = initState.recent || [];
         this.initialChoices = initState.last_choices || [];
+        this.initialTokenRows = initState.token_rows || [];
         if (this.hasSave) {
-          this.continueGame(this.initialRecent, this.initialChoices, { silent: true });
+          this.continueGame(this.initialRecent, this.initialChoices, {
+            silent: true,
+            tokenRows: this.initialTokenRows,
+          });
         } else {
           this.storyModalOpen = true;
         }
@@ -735,6 +739,83 @@ document.addEventListener("alpine:init", () => {
       this._afterPush(shouldFollow);
     },
 
+    handleTokenUsage(event) {
+      const roundId = Number(event.round_id) || 0;
+      const usage = {
+        roundId,
+        isFinal: Boolean(event.is_final),
+        delta: Number(event.delta) || 0,
+        input: Number(event.input) || 0,
+        output: Number(event.output) || 0,
+        cacheRead: Number(event.cache_read) || 0,
+        total: Number(event.total) || 0,
+        cost: event.cost === null || event.cost === undefined ? null : Number(event.cost),
+        model: event.model || "",
+        cumulative: event.cumulative || null,
+      };
+      const existingIdx = this.messages.findIndex(m => m.kind === "token" && m.roundId === roundId);
+      if (existingIdx >= 0) {
+        this.messages[existingIdx] = { ...this.messages[existingIdx], usage };
+        return;
+      }
+      const shouldFollow = this.shouldAutoFollowLatest();
+      this.messages.push({
+        id: this.nextMessageId++,
+        kind: "token",
+        roundId,
+        turn: 0,
+        author: "",
+        content: "",
+        html: "",
+        payload: null,
+        usage,
+      });
+      this._afterPush(shouldFollow);
+    },
+
+    _fmtInt(n) {
+      return Number(n || 0).toLocaleString("en-US");
+    },
+
+    _fmtCost(cost) {
+      if (cost === null || cost === undefined) return "N/A";
+      if (cost < 0.001) return `~$${cost.toFixed(5)}`;
+      if (cost < 1) return `~$${cost.toFixed(5).replace(/0+$/, "").replace(/\.$/, "")}`;
+      return `~$${cost.toFixed(3)}`;
+    },
+
+    formatTokenUsage(usage) {
+      if (!usage) return "";
+      const deltaClass = usage.delta > 10000 ? "token-delta-red"
+        : usage.delta > 5000 ? "token-delta-yellow"
+        : "token-delta-green";
+      const deltaStr = `+${this._fmtInt(usage.delta)}`;
+      const cacheIndicator = usage.cacheRead > 0
+        ? `<span class="token-cache">[*]</span>`
+        : "";
+      const costStr = this._fmtCost(usage.cost);
+      const costClass = usage.cost !== null && usage.cost >= 0.1 ? "token-cost-high" : "";
+      const inputStr = usage.cacheRead > 0
+        ? `${this._fmtInt(usage.input)} <span class="token-dim">(cache: ${this._fmtInt(usage.cacheRead)} read)</span>`
+        : this._fmtInt(usage.input);
+      const pending = usage.isFinal ? "" : `<span class="token-dim" title="本轮 choices 仍在生成中">…</span>`;
+      const sep = `<span class="token-sep">|</span>`;
+      // 默认仅显示：[Tokens] | Cost
+      const head = [
+        `<span class="token-label">[Tokens]</span>`,
+        `<span class="token-dim">Cost:</span> <span class="${costClass}">${costStr}</span>${pending}`,
+      ].join(sep);
+      // hover 展开：delta / cache / Input / Output / Total
+      const detailParts = [
+        `<span class="token-delta ${deltaClass}">${deltaStr}</span>`,
+        cacheIndicator,
+        `<span class="token-dim">Input:</span> <strong>${inputStr}</strong>`,
+        `<span class="token-dim">Output:</span> <strong>${this._fmtInt(usage.output)}</strong>`,
+        `<span class="token-dim">Total:</span> <strong>${this._fmtInt(usage.total)}</strong>`,
+      ].filter(Boolean).join(sep);
+      return `${head}<span class="token-details">${sep}${detailParts}</span>`;
+    },
+
     addSystemMessage({ title = "系统", name = "", identity = "", characterId = "" } = {}) {
       const displayName = String(name || characterId || "新角色").trim();
       const identityText = String(identity || "").trim();
@@ -752,12 +833,66 @@ document.addEventListener("alpine:init", () => {
       this._afterPush(shouldFollow);
     },
 
-    addHistory(messages) {
+    addHistory(messages, tokenRows = []) {
       const { built, minTurn } = this._buildHistoryMessages(messages);
-      if (!built.length) return;
-      this.messages.push(...built);
+      const merged = this._mergeTokenRowsInto(built, tokenRows);
+      if (!merged.length) return;
+      this.messages.push(...merged);
       if (minTurn !== null) this.oldestLoadedTurn = minTurn;
       this.scrollToLatest();
+    },
+
+    _makeTokenMessage(row) {
+      return {
+        id: this.nextMessageId++,
+        kind: "token",
+        roundId: Number(row.round_id) || 0,
+        turn: Number(row.turn) || 0,
+        author: "",
+        content: "",
+        html: "",
+        payload: null,
+        usage: {
+          roundId: Number(row.round_id) || 0,
+          isFinal: true,
+          delta: Number(row.delta) || 0,
+          input: Number(row.input) || 0,
+          output: Number(row.output) || 0,
+          cacheRead: Number(row.cache_read) || 0,
+          total: Number(row.total) || 0,
+          cost: row.cost === null || row.cost === undefined ? null : Number(row.cost),
+          model: row.model || "",
+          cumulative: row.cumulative || null,
+        },
+      };
+    },
+
+    _mergeTokenRowsInto(builtMessages, tokenRows) {
+      if (!tokenRows || !tokenRows.length) return builtMessages;
+      const byTurn = new Map();
+      tokenRows.forEach(row => {
+        const t = Number(row.turn) || 0;
+        if (t > 0) byTurn.set(t, row);
+      });
+      if (!byTurn.size) return builtMessages;
+      // 找到每个 turn 在 builtMessages 中最后一条消息的下标，token 行插到它之后
+      const lastIndexByTurn = new Map();
+      builtMessages.forEach((m, i) => {
+        if (m.turn) lastIndexByTurn.set(m.turn, i);
+      });
+      const out = [];
+      builtMessages.forEach((m, i) => {
+        out.push(m);
+        if (lastIndexByTurn.get(m.turn) === i && byTurn.has(m.turn)) {
+          out.push(this._makeTokenMessage(byTurn.get(m.turn)));
+          byTurn.delete(m.turn);
+        }
+      });
+      // 历史里没找到锚点消息的 token 行（极少；理论上不应发生）追加在末尾
+      Array.from(byTurn.values()).forEach(row => {
+        out.push(this._makeTokenMessage(row));
+      });
+      return out;
     },
 
     scrollToLatest({ settle = false } = {}) {
@@ -778,14 +913,15 @@ document.addEventListener("alpine:init", () => {
       this.nearLatest = true;
     },
 
-    prependHistory(messages) {
+    prependHistory(messages, tokenRows = []) {
       const { built, minTurn } = this._buildHistoryMessages(messages);
-      if (!built.length) return [];
-      this.messages.unshift(...built);
+      const merged = this._mergeTokenRowsInto(built, tokenRows);
+      if (!merged.length) return [];
+      this.messages.unshift(...merged);
       if (minTurn !== null && (this.oldestLoadedTurn == null || minTurn < this.oldestLoadedTurn)) {
         this.oldestLoadedTurn = minTurn;
       }
-      return built;
+      return merged;
     },
 
     async loadOlderHistory() {
@@ -806,7 +942,7 @@ document.addEventListener("alpine:init", () => {
           this.historyExhausted = true;
           return;
         }
-        const inserted = this.prependHistory(fetched);
+        const inserted = this.prependHistory(fetched, response.token_rows || []);
         if (fetched.length < requestLimit) {
           this.historyExhausted = true;
         }
@@ -883,7 +1019,7 @@ document.addEventListener("alpine:init", () => {
             this.historyExhausted = true;
             break;
           }
-          this.prependHistory(fetched);
+          this.prependHistory(fetched, response.token_rows || []);
           if (fetched.length < requestLimit) this.historyExhausted = true;
         } catch (error) {
           this.setNotice("跳转加载失败。", "error");
@@ -1064,12 +1200,12 @@ document.addEventListener("alpine:init", () => {
       }
     },
 
-    continueGame(recent, lastChoices, { silent = false } = {}) {
+    continueGame(recent, lastChoices, { silent = false, tokenRows = [] } = {}) {
       this.storyModalOpen = false;
       this.resetConversation();
       this.choices = lastChoices || [];
       this.choiceStatus = this.choices.length ? "ready" : "hidden";
-      this.addHistory(recent);
+      this.addHistory(recent, tokenRows);
       this.scrollToLatest({ settle: true });
       if (this.isCompact) this.closeDrawer();
       if (!silent) {
@@ -1214,6 +1350,8 @@ document.addEventListener("alpine:init", () => {
           } else {
             this.setNotice("这一轮没有预设选项，你可以直接输入下一句。", "success");
           }
+        } else if (event.type === "token_usage") {
+          this.handleTokenUsage(event);
         } else if (event.type === "done") {
           this.setConsolidating(Boolean(event.consolidating));
         } else if (event.type === "response_done") {
@@ -1954,7 +2092,10 @@ document.addEventListener("alpine:init", () => {
         this.characterCount = response.character_count || 0;
         this.initialRecent = response.recent || [];
         this.initialChoices = response.last_choices || [];
-        this.continueGame(response.recent, response.last_choices);
+        this.initialTokenRows = response.token_rows || [];
+        this.continueGame(response.recent, response.last_choices, {
+          tokenRows: this.initialTokenRows,
+        });
         await this.refreshSaves({ quiet: true });
         this.closeWorldline();
         this.pushToast("存档已加载", "success");

@@ -211,27 +211,124 @@ async def test_chat_stream_yields_response_done_before_choices(monkeypatch):
             await server_module.asyncio.wait_for(anext(stream), timeout=0.1),
             await server_module.asyncio.wait_for(anext(stream), timeout=0.1),
             await server_module.asyncio.wait_for(anext(stream), timeout=0.1),
+            await server_module.asyncio.wait_for(anext(stream), timeout=0.1),
         ]
 
+        # token_usage 在 response_done 前发一次（中间快照，is_final=False）
         assert [_parse_sse_chunk(chunk)["type"] for chunk in chunks] == [
             "narrator",
             "agent",
+            "token_usage",
             "response_done",
         ]
+        assert _parse_sse_chunk(chunks[2])["is_final"] is False
         await server_module.asyncio.wait_for(choices_started.wait(), timeout=0.1)
         assert maintenance_calls == ["state", ("memory", 7)]
 
         release_choices.set()
         choices_chunk = await server_module.asyncio.wait_for(anext(stream), timeout=0.1)
+        final_token_chunk = await server_module.asyncio.wait_for(anext(stream), timeout=0.1)
         done_chunk = await server_module.asyncio.wait_for(anext(stream), timeout=0.1)
 
         assert _parse_sse_chunk(choices_chunk) == {
             "type": "choices",
             "choices": ["继续追问"],
         }
+        # 最终 token 快照（含 choices）：is_final=True
+        final_token = _parse_sse_chunk(final_token_chunk)
+        assert final_token["type"] == "token_usage"
+        assert final_token["is_final"] is True
         assert _parse_sse_chunk(done_chunk)["type"] == "done"
     finally:
         await stream.aclose()
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_emits_final_token_usage_on_choices_cancel(monkeypatch):
+    """choices_task 被 cancel 时，_chat_stream 仍应 emit final token_usage 并落盘。
+
+    Major-3 修复：避免 narrator + characters 已经真实消耗 tokens 但 UI 永久
+    停留在中间快照、session cumulative 不推进的会计漂移。
+    """
+    choices_started = server_module.asyncio.Event()
+    choices_cancelled = server_module.asyncio.Event()
+
+    async def fake_route(_self, user_input, *, observation_mode=False):
+        if user_input == "第一轮":
+            return _narrator_output(scene_description="第一轮场景"), True
+        return None, False
+
+    async def fake_broadcast_player_message(_targets, _user_input):
+        return None
+
+    async def fake_broadcast_narrator_output(_targets, _output):
+        return 9
+
+    async def fake_run_agent_in_scene(*_args, **_kwargs):
+        return "第一轮回应"
+
+    async def fake_generate_choices(_scene_description, _agent_responses):
+        choices_started.set()
+        try:
+            await server_module.asyncio.sleep(3600)
+        except server_module.asyncio.CancelledError:
+            choices_cancelled.set()
+            raise
+        return ["过期选项"]
+
+    monkeypatch.setattr(server_module.narrator.__class__, "route", fake_route)
+    monkeypatch.setattr(
+        server_module.message_router,
+        "broadcast_player_message",
+        fake_broadcast_player_message,
+    )
+    monkeypatch.setattr(
+        server_module.message_router,
+        "broadcast_narrator_output",
+        fake_broadcast_narrator_output,
+    )
+    monkeypatch.setattr(server_module, "run_agent_in_scene", fake_run_agent_in_scene)
+    monkeypatch.setattr(server_module, "generate_choices", fake_generate_choices)
+    monkeypatch.setattr(server_module, "_get_agent_display_name", lambda name: name)
+    monkeypatch.setattr(server_module, "_start_state_update", lambda: None)
+    monkeypatch.setattr(
+        server_module.memory_consolidation_flow,
+        "schedule_detect_and_consolidate",
+        lambda _turn: None,
+    )
+
+    first_stream = server_module._chat_stream("第一轮")
+    try:
+        # 把第一轮跑到 response_done，使 choices_task 已经 await
+        first_chunks = [
+            await server_module.asyncio.wait_for(anext(first_stream), timeout=0.1),  # narrator
+            await server_module.asyncio.wait_for(anext(first_stream), timeout=0.1),  # agent
+            await server_module.asyncio.wait_for(anext(first_stream), timeout=0.1),  # token_usage (中间)
+            await server_module.asyncio.wait_for(anext(first_stream), timeout=0.1),  # response_done
+        ]
+        assert _parse_sse_chunk(first_chunks[-1])["type"] == "response_done"
+
+        # 下一个 chunk 要 await choices_task：把它放后台等待
+        pending_next = server_module.asyncio.create_task(anext(first_stream))
+        await server_module.asyncio.wait_for(choices_started.wait(), timeout=0.1)
+
+        # 模拟第二轮抢占：调用 _invalidate_pending_choices 让 choices_task 被 cancel
+        server_module._invalidate_pending_choices(clear_saved=True)
+        await server_module.asyncio.wait_for(choices_cancelled.wait(), timeout=0.1)
+
+        # 现在 pending_next 应该解出一个 final token_usage 事件
+        token_chunk = await server_module.asyncio.wait_for(pending_next, timeout=0.1)
+        token_event = _parse_sse_chunk(token_chunk)
+        assert token_event["type"] == "token_usage"
+        assert token_event["is_final"] is True
+        # turn 来自 fake_broadcast_narrator_output 返回 9
+        assert token_event["turn"] == 9
+
+        # 之后 generator 应该结束
+        with pytest.raises(StopAsyncIteration):
+            await server_module.asyncio.wait_for(anext(first_stream), timeout=0.1)
+    finally:
+        await first_stream.aclose()
 
 
 @pytest.mark.asyncio
@@ -289,10 +386,13 @@ async def test_new_chat_cancels_pending_choices(monkeypatch):
             await server_module.asyncio.wait_for(anext(first_stream), timeout=0.1),
             await server_module.asyncio.wait_for(anext(first_stream), timeout=0.1),
             await server_module.asyncio.wait_for(anext(first_stream), timeout=0.1),
+            await server_module.asyncio.wait_for(anext(first_stream), timeout=0.1),
         ]
+        # narrator, agent, token_usage (中间), response_done
         assert _parse_sse_chunk(first_chunks[-1])["type"] == "response_done"
+        assert _parse_sse_chunk(first_chunks[-2])["type"] == "token_usage"
 
-        pending_first_choice = server_module.asyncio.create_task(anext(first_stream))
+        pending_first_chunk = server_module.asyncio.create_task(anext(first_stream))
         await server_module.asyncio.wait_for(choices_started.wait(), timeout=0.1)
 
         second_chunks = [
@@ -300,8 +400,14 @@ async def test_new_chat_cancels_pending_choices(monkeypatch):
         ]
 
         await server_module.asyncio.wait_for(choices_cancelled.wait(), timeout=0.1)
+        # Major-3 修复后：cancel 路径仍 emit final token_usage（已发生的 tokens 入账）
+        cancel_chunk = await server_module.asyncio.wait_for(pending_first_chunk, timeout=0.1)
+        cancel_event = _parse_sse_chunk(cancel_chunk)
+        assert cancel_event["type"] == "token_usage"
+        assert cancel_event["is_final"] is True
+        # 之后才是 StopAsyncIteration
         with pytest.raises(StopAsyncIteration):
-            await server_module.asyncio.wait_for(pending_first_choice, timeout=0.1)
+            await server_module.asyncio.wait_for(anext(first_stream), timeout=0.1)
 
         assert [_parse_sse_chunk(chunk)["type"] for chunk in second_chunks] == ["done"]
         assert server_module._load_last_choices() == []
@@ -605,7 +711,8 @@ async def test_chat_stream_emits_created_character_identity(monkeypatch):
 
     chunks = [chunk async for chunk in server_module._chat_stream("来个新角色")]
 
-    assert len(chunks) == 3
+    # system, narrator, token_usage, done
+    assert len(chunks) == 4
     created_event = json.loads(chunks[0].removeprefix("data: ").strip())
     assert created_event == {
         "type": "system",
@@ -617,5 +724,8 @@ async def test_chat_stream_emits_created_character_identity(monkeypatch):
     narrator_event = json.loads(chunks[1].removeprefix("data: ").strip())
     assert narrator_event["type"] == "narrator"
     assert narrator_event["payload"]["scene_description"] == "场景推进"
-    done_event = json.loads(chunks[2].removeprefix("data: ").strip())
+    token_event = json.loads(chunks[2].removeprefix("data: ").strip())
+    assert token_event["type"] == "token_usage"
+    assert token_event["is_final"] is True
+    done_event = json.loads(chunks[3].removeprefix("data: ").strip())
     assert done_event == {"type": "done"}

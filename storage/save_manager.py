@@ -636,6 +636,9 @@ def _get_agent_save_files(agent_name: str) -> list[str]:
         if os.path.exists(raw_dir):
             for jsonl_file in glob.glob(f"{raw_dir}/*.jsonl"):
                 files.append(jsonl_file)
+        token_usage_path = f"{base}/.token_usage.jsonl"
+        if os.path.exists(token_usage_path):
+            files.append(token_usage_path)
 
     return files
 

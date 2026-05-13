@@ -286,6 +286,10 @@
                         <div class="message-card markdown-body" x-html="message.html" :style="`background:${message.background};border-color:${message.border};`"></div>
                       </div>
                     </template>
+
+                    <template x-if="message.kind === 'token'">
+                      <div class="token-bar" x-html="formatTokenUsage(message.usage)"></div>
+                    </template>
                   </article>
                 </template>
               </section>

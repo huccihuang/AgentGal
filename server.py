@@ -20,6 +20,12 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from agents.factory import initialize_conversation_agents, reload_conversation_agent
+from agents.pricing import calculate_cost
+from agents.runner import (
+    UsageAccumulator,
+    bind_accumulator,
+    reset_accumulator,
+)
 from consolidation.flow import memory_consolidation_flow
 from engine.character import narrator, reset_entities
 from engine.conversation_flow import (
@@ -46,6 +52,7 @@ from storage.save_manager import (
     load_story_file,
     reset_game,
 )
+from llm.config import LLM_MODEL_ID
 from log_config.routing import routing_logger
 from log_config.logfire import setup_logfire
 from shared.config import CHARACTERS_DIR, get_agent_names
@@ -57,6 +64,11 @@ from storage.history import (
     load_conversation_history,
     load_history_before,
     search_history,
+)
+from storage.token_usage import (
+    append_token_usage,
+    clear_token_usage,
+    read_token_usage,
 )
 from storage.message_router import message_router
 
@@ -71,6 +83,129 @@ _pending_state_update_requested = False
 _pending_choices_task: asyncio.Task[list[str]] | None = None
 _choices_generation_token = 0
 _RECENT_HISTORY_LIMIT = 12
+
+# Token usage 会话级累计；每次 reset/load 时归零。
+_round_counter: int = 0
+_session_cumulative: dict[str, float] = {
+    "input": 0,
+    "output": 0,
+    "cache_read": 0,
+    "cost": 0.0,
+    "total": 0,
+}
+
+
+def _reset_session_usage() -> None:
+    global _round_counter
+    _round_counter = 0
+    _session_cumulative.update({"input": 0, "output": 0, "cache_read": 0, "cost": 0.0, "total": 0})
+    clear_token_usage()
+
+
+def _aggregate_cost(acc: UsageAccumulator, fallback_model_id: str) -> float | None:
+    """按 phase 聚合成本；phase 自带 model_name 则用之，否则 fallback。
+
+    Returns None 仅当 *所有* 已计 phase 都查不到价格（全未知模型）。
+    无 by_phase 数据时退化到整体计价。
+    """
+    if not acc.by_phase:
+        return calculate_cost(
+            fallback_model_id, acc.input_tokens, acc.output_tokens, acc.cache_read_tokens
+        )
+    total = 0.0
+    any_known = False
+    for data in acc.by_phase.values():
+        phase_cost = calculate_cost(
+            data.get("model") or fallback_model_id,
+            int(data.get("input", 0) or 0),
+            int(data.get("output", 0) or 0),
+            int(data.get("cache_read", 0) or 0),
+        )
+        if phase_cost is not None:
+            total += phase_cost
+            any_known = True
+    return total if any_known else None
+
+
+def _build_token_usage_payload(
+    acc: UsageAccumulator,
+    round_id: int,
+    *,
+    is_final: bool,
+    turn: int = 0,
+) -> dict:
+    """从累加器快照构造 SSE 数据；is_final 时同步推进会话累计并落盘。
+
+    turn 用于持久化定位（关联到 narrator raw 历史里的同一 turn）；turn=0 表示本轮
+    narrator 没有有效发言，不持久化只走 SSE。
+    """
+    model_id = LLM_MODEL_ID
+    inp = acc.input_tokens
+    out = acc.output_tokens
+    cr = acc.cache_read_tokens
+    total = inp + out
+    delta = max(0, inp - cr) + out  # 实际被计费的「新」token 量
+    cost = _aggregate_cost(acc, model_id)
+
+    if is_final:
+        _session_cumulative["input"] = int(_session_cumulative["input"]) + inp
+        _session_cumulative["output"] = int(_session_cumulative["output"]) + out
+        _session_cumulative["cache_read"] = int(_session_cumulative["cache_read"]) + cr
+        _session_cumulative["total"] = int(_session_cumulative["total"]) + total
+        if cost is not None:
+            _session_cumulative["cost"] = float(_session_cumulative["cost"]) + cost
+
+    payload = {
+        "round_id": round_id,
+        "turn": int(turn or 0),
+        "is_final": is_final,
+        "delta": delta,
+        "input": inp,
+        "output": out,
+        "cache_read": cr,
+        "total": total,
+        "cost": cost,
+        "model": model_id,
+        "cumulative": {
+            "input": int(_session_cumulative["input"]),
+            "output": int(_session_cumulative["output"]),
+            "cache_read": int(_session_cumulative["cache_read"]),
+            "total": int(_session_cumulative["total"]),
+            "cost": float(_session_cumulative["cost"]),
+        },
+    }
+
+    if is_final and turn > 0:
+        try:
+            append_token_usage(payload)
+        except Exception as exc:  # noqa: BLE001
+            routing_logger.warning("[token_usage] 持久化失败（忽略）: %s", exc)
+
+    return payload
+
+
+def _recompute_token_row_cost(row: dict) -> dict:
+    """实时用当前 [pricing.models] 重算 cost。
+
+    config.toml 更新或 LLM_MODEL_ID 切换后，历史行的 cost 跟着新表刷新，
+    不再固定为写入时的快照。row.model 缺失时 fallback 到当前 LLM_MODEL_ID。
+
+    只用于 /api/init /api/history /api/load 等历史读取路径；
+    SSE 写盘路径已用当前定价表，无需重算。cumulative.cost 保留行内快照
+    （历史会话累计不做追溯修正）。
+    """
+    model = (row.get("model") or LLM_MODEL_ID).strip()
+    new_cost = calculate_cost(
+        model,
+        int(row.get("input") or 0),
+        int(row.get("output") or 0),
+        int(row.get("cache_read") or 0),
+    )
+    refreshed = dict(row)
+    refreshed["cost"] = new_cost
+    return refreshed
+
+
 _MEMORY_GRAPH_LABEL_LIMIT = 42
 _MEMORY_GRAPH_DETAIL_LIMIT = 260
 _MEMORY_GRAPH_RAW_LIMIT = 12000
@@ -430,10 +565,11 @@ async def index() -> HTMLResponse:
 
 @app.get("/api/init")
 async def api_init() -> JSONResponse:
-    """返回初始状态：是否有存档、最近历史、最近选项。"""
+    """返回初始状态：是否有存档、最近历史、最近选项、最近 token 行。"""
     has_save = has_existing_save()
     recent: list[dict] = []
     last_choices: list[str] = []
+    token_rows: list[dict] = []
 
     if has_save:
         raw = load_conversation_history(limit=_RECENT_HISTORY_LIMIT)
@@ -442,12 +578,19 @@ async def api_init() -> JSONResponse:
             if formatted:
                 recent.append(formatted)
         last_choices = _load_last_choices()
+        min_turn = min((m["turn"] for m in recent if m.get("turn")), default=None)
+        token_rows = (
+            [_recompute_token_row_cost(r) for r in read_token_usage(min_turn=min_turn)]
+            if min_turn
+            else []
+        )
 
     return JSONResponse(
         {
             "has_save": has_save,
             "recent": recent,
             "last_choices": last_choices,
+            "token_rows": token_rows,
             "scene_status": _current_scene_status(),
             "character_count": len(get_agent_names(include_narrator=False)),
         }
@@ -464,7 +607,14 @@ async def api_history(before_turn: int, limit: int = 30) -> JSONResponse:
     limit = max(1, min(limit, 200))
     raw = load_history_before(before_turn=before_turn, limit=limit)
     messages = [m for m in (_format_history_message(item) for item in raw) if m]
-    return JSONResponse({"messages": messages})
+    turns = [m["turn"] for m in messages if m.get("turn")]
+    token_rows: list[dict] = []
+    if turns:
+        token_rows = [
+            _recompute_token_row_cost(r)
+            for r in read_token_usage(min_turn=min(turns), max_turn=max(turns))
+        ]
+    return JSONResponse({"messages": messages, "token_rows": token_rows})
 
 
 @app.get("/api/history/dates")
@@ -562,6 +712,7 @@ async def api_new_game(req: NewGameRequest) -> JSONResponse:
         )
     _invalidate_pending_choices(clear_saved=True)
     await _settle_pending_state_update(cancel=True)
+    _reset_session_usage()
     intro_text, opening_text = await reset_game(req.story_id)
     reset_entities()
     for name in get_agent_names(include_narrator=True):
@@ -595,11 +746,44 @@ class ChatRequest(BaseModel):
 
 async def _chat_stream(user_input: str, mode: Literal["participate", "observe"] = "participate"):
     """核心游戏循环，通过 SSE 逐步推送结果。"""
-    global _pending_choices_task
+    global _pending_choices_task, _round_counter
     observation_mode = mode == "observe"
     choices_token = _invalidate_pending_choices(clear_saved=True)
     # 0 = 哨兵：本轮还没有 narrator 成功发言，不触发 consolidation
     current_turn = 0
+
+    # Token usage：为本轮绑定累加器；同协程上下文的 LLM 调用会被 runner 自动累加。
+    # 注意：state_updater / consolidation 是 detached background task，虽然继承了累加器
+    # 引用但请求返回后无人读取，故其 token 不计入本轮显示（已知 gap）。
+    _round_counter += 1
+    round_id = _round_counter
+    round_acc = UsageAccumulator()
+    acc_token = bind_accumulator(round_acc)
+
+    try:
+        async for event in _chat_stream_body(
+            user_input,
+            observation_mode=observation_mode,
+            choices_token=choices_token,
+            round_id=round_id,
+            round_acc=round_acc,
+            current_turn=current_turn,
+        ):
+            yield event
+    finally:
+        reset_accumulator(acc_token)
+
+
+async def _chat_stream_body(
+    user_input: str,
+    *,
+    observation_mode: bool,
+    choices_token: int,
+    round_id: int,
+    round_acc: UsageAccumulator,
+    current_turn: int,
+):
+    global _pending_choices_task
 
     # 1. narrator 路由
     narrator_output, is_narrator_valid = await narrator.route(
@@ -649,6 +833,10 @@ async def _chat_stream(user_input: str, mode: Literal["participate", "observe"] 
         routing_logger.info("[导演] 无角色需要回应")
         if narrator_output is not None:
             _start_state_update()
+            yield _sse_event(
+                "token_usage",
+                _build_token_usage_payload(round_acc, round_id, is_final=True, turn=current_turn),
+            )
         yield _sse_event("done", {})
         return
 
@@ -686,22 +874,46 @@ async def _chat_stream(user_input: str, mode: Literal["participate", "observe"] 
         # 返回的 task 故意丢弃：MemoryConsolidationFlow._scheduled_task 已是强引用，
         # 任务不会被 GC；新 turn 在已运行任务内 coalesce 成 _pending_turn 补跑。
         memory_consolidation_flow.schedule_detect_and_consolidate(current_turn)
+
+    # 中间 token 快照：narrator + 新角色孵化 + 角色回应
+    yield _sse_event(
+        "token_usage",
+        _build_token_usage_payload(round_acc, round_id, is_final=False, turn=current_turn),
+    )
     yield _sse_event("response_done", {"consolidating": memory_consolidation_flow.is_running})
 
     # 5. 选项是辅助建议：与后台维护并行生成，且新一轮输入会让旧结果失效。
     if choices_task is not None:
+        cancelled = False
+        choices: list[str] = []
         try:
             choices = await choices_task
         except asyncio.CancelledError:
-            return
+            # 本轮被新一轮抢占，但 narrator + characters 的 tokens 已真实消耗；
+            # 仍发 final token_usage 并落盘，避免 UI / 计费漂移。
+            cancelled = True
         finally:
             if _pending_choices_task is choices_task:
                 _pending_choices_task = None
+
+        if cancelled:
+            yield _sse_event(
+                "token_usage",
+                _build_token_usage_payload(
+                    round_acc, round_id, is_final=True, turn=current_turn
+                ),
+            )
+            return
 
         if choices and choices_token == _choices_generation_token:
             _save_last_choices(choices)
             yield _sse_event("choices", {"choices": choices})
 
+    # 最终 token 快照：含 choices；推进会话 cumulative
+    yield _sse_event(
+        "token_usage",
+        _build_token_usage_payload(round_acc, round_id, is_final=True, turn=current_turn),
+    )
     yield _sse_event("done", {"consolidating": memory_consolidation_flow.is_running})
 
 
@@ -818,6 +1030,7 @@ async def api_load(req: LoadRequest) -> JSONResponse:
         )
     _invalidate_pending_choices(clear_saved=True)
     await _settle_pending_state_update(cancel=True)
+    _reset_session_usage()
     success = await import_save_archive(req.filename)
     if success:
         reset_entities()
@@ -826,11 +1039,18 @@ async def api_load(req: LoadRequest) -> JSONResponse:
         raw = load_conversation_history(limit=_RECENT_HISTORY_LIMIT)
         recent = [m for m in (_format_history_message(item) for item in raw) if m]
         last_choices = _load_last_choices()
+        min_turn = min((m["turn"] for m in recent if m.get("turn")), default=None)
+        token_rows = (
+            [_recompute_token_row_cost(r) for r in read_token_usage(min_turn=min_turn)]
+            if min_turn
+            else []
+        )
         return JSONResponse(
             {
                 "ok": True,
                 "recent": recent,
                 "last_choices": last_choices,
+                "token_rows": token_rows,
                 "scene_status": _current_scene_status(),
                 "character_count": len(get_agent_names(include_narrator=False)),
             }
@@ -891,6 +1111,7 @@ async def api_reset(req: ResetRequest) -> JSONResponse:
         )
     _invalidate_pending_choices(clear_saved=True)
     await _settle_pending_state_update(cancel=True)
+    _reset_session_usage()
     intro_text, opening_text = await reset_game(req.story_id)
     reset_entities()
     for name in get_agent_names(include_narrator=True):

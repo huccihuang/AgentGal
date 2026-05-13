@@ -72,3 +72,41 @@ request_timeout_seconds = 30
 max_choice_chars = 50
 # 长期记忆关键词最大数量
 max_episode_keywords = 8
+
+# ============================================
+# 模型成本估算 (USD per 1M tokens)
+# ----
+# 数据来源: OpenRouter most-popular top 20
+#   https://openrouter.ai/api/v1/models
+#   https://openrouter.ai/api/frontend/models/find?order=most-popular
+# 快照: 2026-05-13
+# ----
+# 未在表里的模型 → UI 显示 "N/A",不影响主流程。
+# 价格仅作估算,实际账单以 provider 为准。
+# Key 已去掉 OpenRouter 的 provider 前缀(如 anthropic/claude-sonnet-4.6 → claude-sonnet-4.6),
+# 对齐项目 LLM_MODEL_ID 的命名习惯;有需要可自行加 provider 前缀别名。
+# 每项可填:
+#   input_per_m       (必填) 输入价 cache miss
+#   output_per_m      (必填) 输出价
+#   cache_read_per_m  (可选) cache hit 输入价;留空 → 按 input_per_m 计
+[pricing.models]
+"hy3-preview"                   = { input_per_m = 0.066, output_per_m = 0.26, cache_read_per_m = 0.029 }      # tencent/hy3-preview
+"claude-sonnet-4.6"             = { input_per_m = 3,     output_per_m = 15,  cache_read_per_m = 0.3 }         # anthropic/claude-sonnet-4.6
+"claude-opus-4.7"               = { input_per_m = 5,     output_per_m = 25,  cache_read_per_m = 0.5 }         # anthropic/claude-opus-4.7
+"kimi-k2.6"                     = { input_per_m = 0.74,  output_per_m = 3.5, cache_read_per_m = 0.25 }        # moonshotai/kimi-k2.6
+"deepseek-v4-flash"             = { input_per_m = 0.14,  output_per_m = 0.28, cache_read_per_m = 0.0028 }     # deepseek/deepseek-v4-flash
+"gemini-3-flash-preview"        = { input_per_m = 0.5,   output_per_m = 3,   cache_read_per_m = 0.05 }        # google/gemini-3-flash-preview
+"deepseek-v3.2"                 = { input_per_m = 0.252, output_per_m = 0.378, cache_read_per_m = 0.0252 }    # deepseek/deepseek-v3.2
+"deepseek-v4-pro"               = { input_per_m = 0.435, output_per_m = 0.87, cache_read_per_m = 0.003625 }   # deepseek/deepseek-v4-pro
+"minimax-m2.7"                  = { input_per_m = 0.28,  output_per_m = 1.2 }                                  # minimax/minimax-m2.7
+"claude-opus-4.6"               = { input_per_m = 5,     output_per_m = 25,  cache_read_per_m = 0.5 }         # anthropic/claude-opus-4.6
+"gemini-2.5-flash-lite"         = { input_per_m = 0.1,   output_per_m = 0.4, cache_read_per_m = 0.01 }        # google/gemini-2.5-flash-lite
+"grok-4.1-fast"                 = { input_per_m = 0.2,   output_per_m = 0.5, cache_read_per_m = 0.05 }        # x-ai/grok-4.1-fast
+"nemotron-3-super-120b-a12b"    = { input_per_m = 0.09,  output_per_m = 0.45 }                                 # nvidia/nemotron-3-super-120b-a12b
+"gemini-2.5-flash"              = { input_per_m = 0.3,   output_per_m = 2.5, cache_read_per_m = 0.03 }        # google/gemini-2.5-flash
+"step-3.5-flash"                = { input_per_m = 0.1,   output_per_m = 0.3 }                                  # stepfun/step-3.5-flash
+"owl-alpha"                     = { input_per_m = 0,     output_per_m = 0 }                                    # openrouter/owl-alpha (free)
+"gpt-5.5"                       = { input_per_m = 5,     output_per_m = 30,  cache_read_per_m = 0.5 }         # openai/gpt-5.5
+"gpt-oss-120b"                  = { input_per_m = 0.039, output_per_m = 0.18 }                                 # openai/gpt-oss-120b
+"glm-5.1"                       = { input_per_m = 1.05,  output_per_m = 3.5, cache_read_per_m = 0.525 }       # z-ai/glm-5.1
+"gemini-3.1-flash-lite-preview" = { input_per_m = 0.25,  output_per_m = 1.5, cache_read_per_m = 0.025 }       # google/gemini-3.1-flash-lite-preview

@@ -3456,3 +3456,69 @@ svg {
     width: min(320px, calc(100vw - 24px));
   }
 }
+
+/* Token usage bar — 每轮对话后的 token 统计 */
+.token-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem;
+  margin: 0.45rem 0 0.2rem;
+  padding: 0.25rem 0.5rem;
+  font-family: "JetBrains Mono", "SF Mono", Menlo, monospace;
+  font-size: 0.78rem;
+  color: rgba(110, 87, 83, 0.72);
+  background: transparent;
+  letter-spacing: 0.01em;
+}
+.token-bar .token-label {
+  color: rgba(110, 87, 83, 0.55);
+}
+.token-bar .token-sep {
+  color: rgba(110, 87, 83, 0.32);
+  margin: 0 0.05rem;
+}
+.token-bar .token-dim {
+  color: rgba(110, 87, 83, 0.55);
+  font-weight: 400;
+}
+.token-bar strong {
+  color: var(--text);
+  font-weight: 600;
+}
+.token-bar .token-delta {
+  font-weight: 600;
+}
+.token-bar .token-delta-green {
+  color: #2f8a4f;
+}
+.token-bar .token-delta-yellow {
+  color: #b58400;
+}
+.token-bar .token-delta-red {
+  color: #b45a64;
+}
+.token-bar .token-cache {
+  color: #3a7fb8;
+  font-weight: 600;
+}
+.token-bar .token-cost-high {
+  color: #b45a64;
+  font-weight: 600;
+}
+.token-bar {
+  cursor: default;
+  transition: color 0.15s ease;
+}
+.token-bar:hover {
+  color: rgba(110, 87, 83, 0.92);
+}
+.token-bar .token-details {
+  display: none;
+}
+.token-bar:hover .token-details {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem;
+}

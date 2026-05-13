@@ -6,12 +6,86 @@ import asyncio
 import types
 import typing
 from collections.abc import Callable
+from contextvars import ContextVar, Token
+from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
 from log_config.routing import routing_logger
 from shared.config import AGENT_RUN_MAX_ATTEMPTS
 
 T = TypeVar("T")
+
+
+@dataclass
+class UsageAccumulator:
+    """单轮对话累计 token usage。runner 每次 agent.run 成功后调用 add()。"""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    requests: int = 0
+    # 每个 phase 桶混存 int（token 计数）和 str（model 标签），用 Any 简化。
+    by_phase: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    def add(self, usage: Any, phase: str = "", model_name: str = "") -> None:
+        """从 pydantic-ai RunUsage 实例累加；字段缺失时静默忽略。
+
+        model_name 用于 per-phase 计价：同一会话出现多模型时，按 phase 分别按
+        正确单价折算成本（见 server._aggregate_cost）。
+        """
+        if usage is None:
+            return
+        inp = int(getattr(usage, "input_tokens", 0) or 0)
+        out = int(getattr(usage, "output_tokens", 0) or 0)
+        cr = int(getattr(usage, "cache_read_tokens", 0) or 0)
+        cw = int(getattr(usage, "cache_write_tokens", 0) or 0)
+        self.input_tokens += inp
+        self.output_tokens += out
+        self.cache_read_tokens += cr
+        self.cache_write_tokens += cw
+        self.requests += int(getattr(usage, "requests", 1) or 1)
+        if phase:
+            bucket = self.by_phase.setdefault(
+                phase, {"input": 0, "output": 0, "cache_read": 0, "model": ""}
+            )
+            bucket["input"] = int(bucket.get("input", 0)) + inp
+            bucket["output"] = int(bucket.get("output", 0)) + out
+            bucket["cache_read"] = int(bucket.get("cache_read", 0)) + cr
+            if model_name and not bucket.get("model"):
+                bucket["model"] = model_name
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+
+# 当前轮的累加器；server.py 在 chat_stream 开始时 set，结束后 reset。
+_current_accumulator: ContextVar[UsageAccumulator | None] = ContextVar(
+    "agentgal_round_usage_accumulator", default=None
+)
+
+
+def bind_accumulator(acc: UsageAccumulator | None) -> Token:
+    """绑定当前 asyncio 上下文的累加器；返回 token 用于 reset。"""
+    return _current_accumulator.set(acc)
+
+
+def reset_accumulator(token: Token) -> None:
+    """恢复累加器绑定。
+
+    在 async generator 被外部 aclose() 时，finally 可能在不同的 Context 中执行，
+    导致 token 与当前 Context 不匹配抛 ValueError。此时退化为在当前 Context 中
+    清空绑定即可（generator 已结束，无需精确还原）。
+    """
+    try:
+        _current_accumulator.reset(token)
+    except ValueError:
+        _current_accumulator.set(None)
+
+
+def get_accumulator() -> UsageAccumulator | None:
+    return _current_accumulator.get()
 
 
 def _matches_output_type(value: Any, output_type: Any) -> bool:
@@ -65,6 +139,18 @@ async def _run_agent_with_retries(
                 agent.run(user_input, metadata=metadata),
                 timeout=timeout_seconds,
             )
+            acc = get_accumulator()
+            if acc is not None:
+                try:
+                    acc.add(
+                        result.usage(),
+                        phase=metadata.get("usage_phase", ""),
+                        model_name=metadata.get("model_name", ""),
+                    )
+                except Exception as usage_err:  # noqa: BLE001
+                    routing_logger.warning(
+                        "[%s] usage 抽取失败（忽略）: %s", label, usage_err
+                    )
             return on_result(result)
         except Exception as exc:
             exc_desc = (

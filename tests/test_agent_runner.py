@@ -22,9 +22,24 @@ class _StructuredOutput(BaseModel):
 
 
 class _FakeResult:
-    def __init__(self, output):
+    def __init__(self, output, *, usage=None):
         self.output = output
         self.response = "raw-response"
+        self._usage = usage
+
+    def usage(self):
+        return self._usage
+
+
+class _FakeUsage:
+    """模拟 pydantic-ai RunUsage 的字段子集。"""
+
+    def __init__(self, input_tokens=0, output_tokens=0, cache_read_tokens=0, cache_write_tokens=0, requests=1):
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+        self.cache_read_tokens = cache_read_tokens
+        self.cache_write_tokens = cache_write_tokens
+        self.requests = requests
 
 
 class _FakeAgent:
@@ -216,6 +231,61 @@ async def test_run_structured_agent_stops_after_three_attempts():
         )
 
     assert agent.calls == ["hi", "hi", "hi"]
+
+
+@pytest.mark.asyncio
+async def test_usage_is_captured_when_accumulator_bound():
+    """绑定累加器后，runner 应把 result.usage() 累加进去。"""
+    usage = _FakeUsage(input_tokens=1000, output_tokens=200, cache_read_tokens=400)
+    agent = _FakeAgent(_FakeResult("hello", usage=usage))
+
+    acc = agent_runner_module.UsageAccumulator()
+    token = agent_runner_module.bind_accumulator(acc)
+    try:
+        await agent_runner_module.run_text_agent(
+            agent=agent,
+            user_input="hi",
+            timeout_seconds=1,
+            workflow_name="wf",
+            trace_metadata=None,
+            usage_agent="tester",
+            usage_phase="agent_run",
+            model_name="deepseek-chat",
+        )
+    finally:
+        agent_runner_module.reset_accumulator(token)
+
+    assert acc.input_tokens == 1000
+    assert acc.output_tokens == 200
+    assert acc.cache_read_tokens == 400
+    assert acc.total_tokens == 1200
+    # 同一 phase 应在 by_phase 里聚合
+    assert acc.by_phase["agent_run"]["input"] == 1000
+    assert acc.by_phase["agent_run"]["output"] == 200
+    assert acc.by_phase["agent_run"]["cache_read"] == 400
+    # per-phase model 来自 metadata.model_name，用于多模型场景按 phase 计价
+    assert acc.by_phase["agent_run"]["model"] == "deepseek-chat"
+
+
+@pytest.mark.asyncio
+async def test_usage_capture_no_op_when_accumulator_not_bound():
+    """没有绑定累加器时不应抛错。"""
+    usage = _FakeUsage(input_tokens=1000, output_tokens=200)
+    agent = _FakeAgent(_FakeResult("hello", usage=usage))
+
+    # 确保没有累加器
+    assert agent_runner_module.get_accumulator() is None
+    output = await agent_runner_module.run_text_agent(
+        agent=agent,
+        user_input="hi",
+        timeout_seconds=1,
+        workflow_name="wf",
+        trace_metadata=None,
+        usage_agent="tester",
+        usage_phase="agent_run",
+        model_name="deepseek-chat",
+    )
+    assert output == "hello"
 
 
 @pytest.mark.asyncio

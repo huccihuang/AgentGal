@@ -763,15 +763,96 @@ def _build_new_save_path(theme: str, save_dir: Path) -> tuple[str, Path, str]:
     return filename, save_dir / filename, save_id
 
 
-async def export_save_archive_with_detail() -> tuple[str | None, str | None]:
+def _compute_content_hash() -> str:
+    """计算当前游戏状态的内容哈希，用于存档去重。
+
+    哈希覆盖：回合数、各角色 status.md、各角色 memory_draft.jsonl 末行、
+    narrator 原始对话历史末条消息。任一组件变化都会产生不同哈希。
+    """
+    hasher = hashlib.sha256()
+
+    turn = read_turn_counter()
+    hasher.update(str(turn).encode())
+
+    for agent in get_agent_names():
+        status_text = read_agent_file(agent, "status.md")
+        if status_text:
+            hasher.update(status_text.encode())
+
+        if agent == "narrator":
+            continue
+
+        draft_path = Path(character_path(agent, "memory_draft.jsonl"))
+        if draft_path.exists():
+            lines = draft_path.read_text(encoding="utf-8").strip().splitlines()
+            if lines:
+                hasher.update(lines[-1].encode())
+
+    raw_dir = character_path("narrator", "raw")
+    if os.path.exists(raw_dir):
+        jsonl_files = sorted(glob.glob(f"{raw_dir}/*.jsonl"))
+        if jsonl_files:
+            last_file = jsonl_files[-1]
+            lines = Path(last_file).read_text(encoding="utf-8").strip().splitlines()
+            if lines:
+                hasher.update(lines[-1].encode())
+
+    return hasher.hexdigest()
+
+
+def _find_duplicate_save(parent_save_id: str, content_hash: str) -> str | None:
+    """在当前分支上查找内容相同的已有存档。
+
+    两步检查：
+    1. 先找直接父节点（save_id == parent_save_id，即上一次存档）— 覆盖"存储两次"场景
+    2. 再找兄弟节点（parent_save_id 相同）— 覆盖"读旧档后存储"场景
+
+    只在同一分支内匹配，避免跨分支误判。
+    返回匹配的文件名；无匹配返回 None。
+    """
+    save_dir = PROJECT_ROOT / "saves"
+    if not save_dir.exists():
+        return None
+
+    parent_key = parent_save_id or None
+
+    for zip_file in save_dir.glob("*.zip"):
+        meta = _read_archive_metadata(zip_file)
+        if meta.get("save_id") == parent_save_id and meta.get("content_hash") == content_hash:
+            return zip_file.name
+
+    for zip_file in save_dir.glob("*.zip"):
+        meta = _read_archive_metadata(zip_file)
+        meta_parent = meta.get("parent_save_id") or None
+        if meta_parent == parent_key and meta.get("content_hash") == content_hash:
+            return zip_file.name
+
+    return None
+
+
+async def export_save_archive_with_detail() -> tuple[str | None, str | None, bool]:
     """导出不可变存档节点，并返回路径或可直接展示的错误详情。
 
+    自动去重：如果当前分支下已存在内容相同的存档，直接返回已有存档路径，
+    不创建新节点。
+
     Returns:
-        (save_path, error_detail)
+        (save_path, error_detail, is_duplicate)
     """
     theme = _read_story_theme()
     parent_save_id = _read_save_id()
     turn = read_turn_counter()
+
+    content_hash = _compute_content_hash()
+
+    existing = _find_duplicate_save(parent_save_id, content_hash)
+    if existing:
+        existing_path = PROJECT_ROOT / "saves" / existing
+        existing_meta = _read_archive_metadata(existing_path)
+        existing_save_id = existing_meta.get("save_id") or existing.rsplit("_", 1)[-1].replace(".zip", "")
+        _write_save_id(existing_save_id)
+        print(f"[存档] 内容未变化，复用已有存档: {existing}")
+        return str(existing_path), None, True
 
     save_dir = PROJECT_ROOT / "saves"
     os.makedirs(save_dir, exist_ok=True)
@@ -785,7 +866,7 @@ async def export_save_archive_with_detail() -> tuple[str | None, str | None]:
     all_agents = get_agent_names()
     if not all_agents:
         print("[存档] 没有找到任何角色")
-        return None, "没有找到任何角色，无法创建存档。"
+        return None, "没有找到任何角色，无法创建存档。", False
 
     temp_path = save_dir / f".{filename}.{uuid.uuid4().hex}.tmp"
 
@@ -809,6 +890,7 @@ async def export_save_archive_with_detail() -> tuple[str | None, str | None]:
                 "created_at": export_time,
                 "save_id": save_id,
                 "parent_save_id": parent_save_id or None,
+                "content_hash": content_hash,
                 "filename": filename,
                 "story_id": theme,
                 "turn": turn,
@@ -853,17 +935,17 @@ async def export_save_archive_with_detail() -> tuple[str | None, str | None]:
         os.replace(temp_path, save_path)
         _write_save_id(save_id)
         print(f"[存档] 导出完成: {save_path}")
-        return str(save_path), None
+        return str(save_path), None, False
 
     except Exception as e:
         temp_path.unlink(missing_ok=True)
         detail = f"{type(e).__name__}: {e}"
         print(f"[存档] 导出失败: {detail}")
         routing_logger.error("[save] 导出异常: %s\n%s", detail, traceback.format_exc())
-        return None, detail
+        return None, detail, False
 
 
 async def export_save_archive() -> str | None:
     """兼容旧接口：仅返回存档路径。"""
-    save_path, _ = await export_save_archive_with_detail()
+    save_path, _, _ = await export_save_archive_with_detail()
     return save_path

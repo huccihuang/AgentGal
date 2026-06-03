@@ -2032,9 +2032,14 @@ document.addEventListener("alpine:init", () => {
         if (response.ok) {
           this.hasSave = true;
           await this.refreshSaves({ quiet: true });
-          const savedName = response.filename || "新节点";
-          this.setNotice(`已记录世界线节点：${savedName}`, "success");
-          this.pushToast("世界线节点已创建", "success");
+          if (response.duplicate) {
+            this.setNotice("当前进度已存在同名存档，无需重复保存。", "info");
+            this.pushToast("世界线节点已存在，无需重复保存", "info");
+          } else {
+            const savedName = response.filename || "新节点";
+            this.setNotice(`已记录世界线节点：${savedName}`, "success");
+            this.pushToast("世界线节点已创建", "success");
+          }
         } else {
           throw new Error(response.detail || "存档失败");
         }

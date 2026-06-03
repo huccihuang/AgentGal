@@ -316,7 +316,7 @@ async def _collect_stream(stream):
 @pytest.mark.asyncio
 async def test_api_save_returns_error_detail(monkeypatch):
     async def fake_export_save_archive_with_detail():
-        return None, "sqlite 已锁定"
+        return None, "sqlite 已锁定", False
 
     logged: list[str] = []
 
@@ -345,7 +345,7 @@ async def test_api_save_rejects_target_filename(monkeypatch):
     async def fake_export_save_archive_with_detail():
         nonlocal called
         called = True
-        return "/tmp/school_slot.zip", None
+        return "/tmp/school_slot.zip", None, False
 
     monkeypatch.setattr(
         server_module,

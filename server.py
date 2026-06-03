@@ -786,10 +786,10 @@ async def api_save(req: SaveRequest | None = None) -> JSONResponse:
                 },
                 status_code=400,
             )
-        save_path, error_detail = await export_save_archive_with_detail()
+        save_path, error_detail, is_duplicate = await export_save_archive_with_detail()
         if save_path:
             return JSONResponse(
-                {"ok": True, "path": save_path, "filename": Path(save_path).name}
+                {"ok": True, "path": save_path, "filename": Path(save_path).name, "duplicate": is_duplicate}
             )
         detail = error_detail or "存档导出失败。"
         routing_logger.error("[save] /api/save 失败: %s", detail)

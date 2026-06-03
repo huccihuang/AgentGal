@@ -180,10 +180,11 @@ async def test_export_new_save_uses_fresh_slot_filename(tmp_path: Path, monkeypa
     )
     monkeypatch.setattr(save_manager, "_read_narrator_focus", lambda: "屋顶")
 
-    save_path, error = await save_manager.export_save_archive_with_detail()
+    save_path, error, is_duplicate = await save_manager.export_save_archive_with_detail()
 
     assert error is None
     assert save_path is not None
+    assert not is_duplicate
     archive_path = Path(save_path)
     assert archive_path.name.startswith("school_")
     assert archive_path.name.endswith(".zip")
@@ -203,15 +204,13 @@ async def test_export_new_save_uses_fresh_slot_filename(tmp_path: Path, monkeypa
         "save_id"
     ]
 
-    second_path, second_error = await save_manager.export_save_archive_with_detail()
+    second_path, second_error, second_duplicate = await save_manager.export_save_archive_with_detail()
 
     assert second_error is None
     assert second_path is not None
-    with zipfile.ZipFile(second_path) as zf:
-        second_metadata = json.loads(zf.read("metadata.json").decode("utf-8"))
-        assert second_metadata["parent_save_id"] == metadata["save_id"]
-        assert second_metadata["save_id"] != metadata["save_id"]
-
+    assert second_duplicate
+    # 去重后返回的是已有存档，不会再创建新文件
+    assert second_path == save_path
 
 def test_list_save_worldlines_groups_by_story_and_parent(tmp_path: Path, monkeypatch):
     save_dir = tmp_path / "saves"
